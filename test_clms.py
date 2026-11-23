@@ -3,6 +3,7 @@ import threading
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen
 from http.server import ThreadingHTTPServer
 
@@ -20,6 +21,23 @@ SAMPLE = """2026-11-23 山田太郎 <yamada@example.com>
 \t* 読書 : 本の記録
 \tSQLiteを読む
 """
+
+
+class FakeEmbedder:
+    model_id = "test-embedding-v1"
+
+    def __init__(self):
+        self.calls = []
+
+    def encode(self, texts):
+        self.calls.append(list(texts))
+        vectors = []
+        for text in texts:
+            if any(word in text for word in ("ランチ", "昼食", "食事")):
+                vectors.append([1.0, 0.0])
+            else:
+                vectors.append([0.0, 1.0])
+        return vectors
 
 
 class ParseTests(unittest.TestCase):
@@ -139,6 +157,35 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(clms.search_database(legacy_db, "対象外", 1, 10).total, 0)
         self.assertEqual(clms.search_database(legacy_db, "検索機能", 1, 10).total, 1)
 
+    def test_hybrid_search_finds_semantically_related_entry_and_reuses_vectors(self):
+        source = (
+            "2026-11-23 山田太郎 <yamada@example.com>\n"
+            "\t* 日記 : ランチの支出\n"
+            "\t食事代を記録した\n"
+            "\t* 開発 : Python設定\n"
+            "\t開発環境を整える\n"
+        )
+        days = clms.parse_source(source)
+        embedder = FakeEmbedder()
+        self.assertEqual(clms.sync_database(self.dbfile, days, embedder=embedder), (2, 0, 0))
+        self.assertEqual(len(embedder.calls), 1)
+
+        clms.sync_database(self.dbfile, days, embedder=embedder)
+        self.assertEqual(len(embedder.calls), 1)
+
+        keyword_page = clms.search_database(
+            self.dbfile, "昼食代", 1, 10, mode="bm25", embedder=embedder
+        )
+        self.assertEqual(keyword_page.total, 0)
+
+        hybrid_page = clms.search_database(
+            self.dbfile, "昼食代", 1, 10, mode="hybrid", embedder=embedder
+        )
+        self.assertEqual(hybrid_page.total, 1)
+        self.assertEqual(hybrid_page.rows[0]["title"], "ランチの支出")
+        self.assertEqual(hybrid_page.mode, "hybrid")
+        self.assertEqual(len(embedder.calls), 2)
+
 
 class HtmlTests(unittest.TestCase):
     def test_linkify_escapes_html_and_links_supported_urls(self):
@@ -162,8 +209,10 @@ class HttpTests(unittest.TestCase):
             cssfile.write_text("body { color: red; }", encoding="utf-8")
             clms.initialize_database(dbfile)
             clms.sync_database(dbfile, clms.parse_source(SAMPLE))
+            embedder = FakeEmbedder()
             server = ThreadingHTTPServer(
-                ("127.0.0.1", 0), clms.make_handler(dbfile, cssfile)
+                ("127.0.0.1", 0),
+                clms.make_handler(dbfile, cssfile, embedder=embedder),
             )
             self.assertEqual(server.server_address[0], clms.LOOPBACK_HOST)
             worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -175,6 +224,14 @@ class HttpTests(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                     self.assertIn("SQLiteの検索機能", page)
                     self.assertIn("次へ", page)
+                    self.assertIn('option value="hybrid" selected', page)
+                    self.assertIn("mode=hybrid", page)
+                with urlopen(f"{base_url}/search?q=SQLite&mode=bm25") as response:
+                    page = response.read().decode("utf-8")
+                    self.assertIn('option value="bm25" selected', page)
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(f"{base_url}/search?q=SQLite&mode=unknown")
+                self.assertEqual(error.exception.code, 400)
                 with urlopen(f"{base_url}/style.css") as response:
                     self.assertEqual(response.read(), b"body { color: red; }")
             finally:
@@ -206,6 +263,7 @@ class MainTests(unittest.TestCase):
                             "--source", str(source),
                             "--dbfile", str(dbfile),
                             "--port", "18080",
+                            "--search-mode", "bm25",
                         ]
                     )
             self.assertEqual(result, 1)

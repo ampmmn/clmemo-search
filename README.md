@@ -8,15 +8,53 @@
 
 `clms.py` は、ChangeLog形式のテキストメモをSQLiteデータベースに同期し、FTS5で検索するローカルHTTPサーバーです。検索結果はHTMLで返し、スタイルは `clms.css` で変更できます。
 
-- Python標準ライブラリのみを使用します。
+- BM25検索はPython標準ライブラリのみで動作します。
+- 既定のハイブリッド検索には `requirements-embedding.txt` の依存関係が必要です。
 - Python 3.10以降を想定します。
 - SQLiteがFTS5および `trigram` tokenizerに対応している必要があります。未対応の場合は起動時にエラーになります。
 - サーバーはIPv4ループバックアドレス `127.0.0.1` のみで待ち受けます。
+
+ハイブリッド検索を使う場合は、初回起動前に依存関係をインストールします。
+
+```powershell
+python -m pip install -r requirements-embedding.txt
+```
+
+初回は既定の多言語モデル `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` が必要に応じてダウンロードされます。モデルを事前に取得しておくか、`--search-mode bm25` で起動すれば、モデルなしでBM25検索だけを利用できます。
+
+### モデルを手動でダウンロードして配置する
+
+ネットワークに接続できるPCでモデルファイルを取得し、実行環境へコピーする場合は次の手順を使います。
+
+1. ブラウザーで[モデルのFiles and versions](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/tree/main)を開きます。
+
+2. リポジトリ内のファイル一式をダウンロードします。重みファイル（`model.safetensors` または `pytorch_model.bin`）だけでなく、設定・tokenizerファイルと `1_Pooling` などのサブディレクトリも必要です。ディレクトリ構成を保ったままコピーしてください。
+
+3. 実行PC上の安定した場所へ展開します。例: `%LOCALAPPDATA%\clms\models\paraphrase-multilingual-MiniLM-L12-v2`。展開先の直下に `modules.json`、`1_Pooling\config.json`、重みファイルがあることを確認します。
+
+```
+git lfs install
+git clone https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+```
+
+4. 起動時に `--embedding-model` でそのディレクトリを指定します。
+
+```powershell
+python clms.py --source "memo.txt" --dbfile "memo.sqlite3" --port 18080 --embedding-model "$env:LOCALAPPDATA\clms\models\paraphrase-multilingual-MiniLM-L12-v2"
+```
+
+`sentence-transformers` などのPythonパッケージはモデルファイルとは別に必要です。実行PCにネットワークがない場合は、先に別途パッケージをインストールするか、BM25のみで起動してください。ローカルディレクトリを指定すれば、モデルをHugging Faceから自動取得する必要はありません。配置先や `--embedding-model` の値を変更するとモデルIDが変わり、Embeddingを再生成します。配置先は固定して使用してください。
 
 ## 起動方法
 
 ```powershell
 python clms.py --source "memo.txt" --dbfile "memo.sqlite3" --port 18080
+```
+
+BM25検索だけを使う場合:
+
+```powershell
+python clms.py --source "memo.txt" --dbfile "memo.sqlite3" --port 18080 --search-mode bm25
 ```
 
 除外タグを指定する場合:
@@ -33,8 +71,10 @@ python clms.py --source "memo.txt" --dbfile "memo.sqlite3" --port 18080 --exclud
 | `--dbfile` | はい | SQLiteデータベースファイル |
 | `--port` | はい | 待ち受けポート（1〜65535） |
 | `--exclude-tags` | いいえ | カンマ区切りの除外タグ。例: `--exclude-tags=private,skip` |
+| `--search-mode` | いいえ | 省略時の検索方式。`hybrid`（既定）または `bm25` |
+| `--embedding-model` | いいえ | sentence-transformersのモデル名またはローカルパス |
 
-起動時にソースを解析・同期してからサーバーを開始します。ポートのバインドに失敗した場合は、バックトレースではなくエラーログを出し、異常終了します。初期同期後のポートエラーでも、同期済みデータベースは残ります。
+`--search-mode` は省略時の検索方式です。リクエストの `mode` クエリパラメータを指定すると、起動時の設定より優先されます。起動時にソースを解析・同期してからサーバーを開始します。ハイブリッド時は不足Embeddingを生成するため、初回同期に時間がかかることがあります。ポートのバインドに失敗した場合は、バックトレースではなくエラーログを出し、異常終了します。初期同期後のポートエラーでも、同期済みデータベースは残ります。
 
 ## メモファイル形式
 
@@ -80,6 +120,7 @@ YYYY-MM-DD Name <mail-address>
 
 - `day_header`: 日付、作成者名・メール、日単位SHA-1。
 - `entry`: `day_id`、`source_key`、タグ、タイトル、本文、エントリSHA-1。
+- `entry_embedding`: `entry_id` を外部キーとするEmbedding、元本文のSHA-1、モデルID、次元数。ベクトルは正規化済みfloat32のSQLite BLOBとして保存し、エントリ削除時に連動削除します。
 - `entry_fts`: `entry` を外部コンテンツとするFTS5テーブル。`tags`、`title`、`body` を `trigram` tokenizerで索引付けします。
 
 `entry` の追加・更新・削除はSQLiteトリガーで `entry_fts` に反映します。FTSの列、tokenizer、トリガーを変更する場合は、既存DBとの互換性と索引再構築の要否を検討してください。
@@ -90,6 +131,7 @@ YYYY-MM-DD Name <mail-address>
 2. 日付・位置キー・SHA-1を比較して追加、変更、削除を反映します。
 3. ソースファイルを2秒間隔で読みます。内容SHA-1の変更を連続した確認で検出してから同期し、書き込み途中の一時状態を避けます。
 4. 同期失敗時はトランザクションをロールバックし、警告を出して次の監視周期に再試行します。
+5. ハイブリッドモードでは新規・変更分のEmbeddingをバッチ生成します。位置キー変更などで行が再作成されても、内容SHA-1が一致する保存済みEmbeddingを再利用します。BM25モードで変更された行のEmbeddingは、次にハイブリッド検索する際に補完されます。
 
 ### 除外タグ
 
@@ -102,14 +144,17 @@ YYYY-MM-DD Name <mail-address>
 ## 検索仕様
 
 ```text
-/search?q={query}&page={page}&limit={limit}
+/search?q={query}&mode={hybrid|bm25}&page={page}&limit={limit}
 ```
 
 - `q`: UTF-8の検索語。空白区切りの語はAND条件で、すべてを含むエントリが対象です。分割はPythonの `str.split()` に従います。
+- `mode`: `hybrid` または `bm25`。省略時は `--search-mode` の設定に従い、その既定値は `hybrid` です。
 - `page`: 1始まりのページ番号。既定値は `1`。
 - `limit`: 1ページの件数。既定値は `10`、最大値は `100`。
 - SQLの行オフセットは `(page - 1) * limit` です。
 - タグ、タイトル、本文を検索対象とします。
+
+検索画面の方式セレクターとページ送りは、現在の `mode` を引き継ぎます。不正な方式名にはHTTP 400を返します。モデル未導入などEmbeddingの利用不可時には、ハイブリッド検索はHTTP 503を返します。BM25検索は引き続き利用できます。
 
 ### 日本語検索と順位
 
@@ -118,6 +163,10 @@ YYYY-MM-DD Name <mail-address>
 - 1〜2文字の語はtrigramの制限を補うためLIKE部分一致で検索します。長い語と混在する場合も短い語をAND条件にし、順位は長い語に対するBM25です。
 - すべて1〜2文字の場合は、出現数に基づく簡易順位を使用します（タグ×5、タイトル×4、本文×1）。この場合はBM25ではありません。
 - LIKE検索では `%`、`_`、`!` をエスケープします。
+- ハイブリッド検索では、既定モデルでエントリ本文と検索語をEmbedding化し、正規化ベクトルの内積（コサイン類似度）で意味的に近い候補を検索します。
+- 類似度0.35以上の上位100件を意味検索候補とし、BM25順位とReciprocal Rank Fusion（`k=60`）で統合します。検索対象はBM25候補と意味検索候補の和集合です。
+- `--search-mode bm25` または `mode=bm25` でEmbedding検索を使わず、既存のBM25検索だけに切り替えられます。Embeddingデータは削除しません。
+- ベクトル比較は現状、SQLiteから候補ベクトルを読みPython側で全件比較します。検索時間はエントリ数に依存します。
 
 ## HTTP・HTML・CSS
 
@@ -133,13 +182,16 @@ YYYY-MM-DD Name <mail-address>
 
 - `clms.py`: パーサー、SQLite/FTS5初期化・同期、検索、HTML生成、HTTPサーバー、CLI。
 - `clms.css`: HTMLレポートのスタイル。
-- `test_clms.py`: 標準ライブラリ `unittest` によるパーサー、同期、検索、HTML、HTTP、CLI、ネットワーク制約のテスト。
+- `requirements-embedding.txt`: ハイブリッド検索で使う任意依存関係。
+- `test_clms.py`: 標準ライブラリ `unittest` によるパーサー、同期、BM25/ハイブリッド検索、HTML、HTTP、CLI、ネットワーク制約のテスト。Embedding検索は決定的なテスト用モデルで検証し、実モデルのダウンロードに依存しません。
 
 変更時の注意:
 
 - 区切り判定の変更では、タブだけの行、真の空行、空行後の本文、空行後の次エントリをテストしてください。
 - `source_key` は位置ベースです。パーサーやエントリ数の扱いを変更すると既存DBの差分判定に影響します。
 - 除外タグは初回同期と `SourceWatcher` の両方に渡します。片方だけ変更すると、起動時と監視時の挙動が異なります。
+- ハイブリッド順位では類似度のしきい値と上位候補数が検索品質・速度に影響します。変更時はBM25単独と同じ検索語セットで結果と応答時間を比較してください。
+- `entry_embedding.model_id` が変わると既存ベクトルを再利用せず再生成します。モデル変更後の初回同期・検索時間に注意してください。
 - HTMLに新しいデータを追加する際は必ずエスケープし、リンク化ではHTTP(S)以外を許可しないでください。
 - 個人メモ用途のため、サーバーの待ち受け先を変更せずループバック限定を維持してください。
 

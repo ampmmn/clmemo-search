@@ -9,12 +9,15 @@ import hashlib
 import html
 import ipaddress
 import logging
+import math
 import re
 import sqlite3
+import struct
 import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 
@@ -22,6 +25,12 @@ POLL_INTERVAL_SECONDS = 2.0
 MAX_LIMIT = 100
 LOOPBACK_HOST = "127.0.0.1"
 LOGGER = logging.getLogger("clms")
+DEFAULT_SEARCH_MODE = "hybrid"
+SEARCH_MODES = ("hybrid", "bm25")
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+RRF_K = 60
+SEMANTIC_TOP_K = 100
+MIN_SEMANTIC_SIMILARITY = 0.60
 
 HEADER_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<author>.*?)\s+<(?P<mail>[^<>]*)>\s*$"
@@ -56,10 +65,60 @@ class DayRecord:
 
 @dataclass
 class SearchPage:
-    rows: list[sqlite3.Row]
+    rows: list[sqlite3.Row | dict[str, object]]
     total: int
     page: int
     limit: int
+    mode: str = "bm25"
+
+
+class Embedder(Protocol):
+    model_id: str
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        """複数の文章を正規化済みEmbeddingに変換する。"""
+
+
+class EmbeddingError(RuntimeError):
+    """Embeddingモデルの読み込みまたは推論に関するエラー。"""
+
+
+class SentenceTransformerEmbedder:
+    """sentence_transformersを遅延読み込みするEmbedding生成器。"""
+
+    def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL):
+        self.model_id = model_name
+        self._model = None
+        self._lock = threading.Lock()
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        with self._lock:
+            if self._model is None:
+                try:
+                    from sentence_transformers import SentenceTransformer
+                except ImportError as exc:
+                    raise EmbeddingError(
+                        "ハイブリッド検索にはsentence-transformersが必要です。"
+                        "python -m pip install -r requirements-embedding.txt を実行してください。"
+                    ) from exc
+                try:
+                    self._model = SentenceTransformer(self.model_id)
+                except Exception as exc:
+                    raise EmbeddingError(
+                        f"Embeddingモデルを読み込めません: {self.model_id}: {exc}"
+                    ) from exc
+            try:
+                vectors = self._model.encode(
+                    texts,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+            except Exception as exc:
+                raise EmbeddingError(f"Embeddingを生成できません: {exc}") from exc
+        return [[float(value) for value in vector] for vector in vectors]
 
 
 def _sha1(value: str) -> str:
@@ -211,6 +270,17 @@ def initialize_database(dbfile: str | Path) -> None:
                 sha1 TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS entry_embedding (
+                entry_id INTEGER PRIMARY KEY REFERENCES entry(id) ON DELETE CASCADE,
+                content_sha1 TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                vector BLOB NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS entry_embedding_model_idx
+                ON entry_embedding(model_id);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS entry_fts
             USING fts5(
                 tags,
@@ -254,16 +324,171 @@ def initialize_database(dbfile: str | Path) -> None:
         connection.close()
 
 
+def _embedding_text(tags: str, title: str, body: str) -> str:
+    return f"タイトル: {title}\nタグ: {tags}\n本文:\n{body}".strip()
+
+
+def _normalize_vector(vector: list[float]) -> list[float]:
+    if not vector or any(not math.isfinite(value) for value in vector):
+        raise EmbeddingError("Embeddingの次元または値が不正です")
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm == 0:
+        raise EmbeddingError("ゼロベクトルはEmbeddingとして保存できません")
+    return [value / norm for value in vector]
+
+
+def _pack_vector(vector: list[float]) -> tuple[int, bytes]:
+    normalized = _normalize_vector(vector)
+    return len(normalized), struct.pack(f"<{len(normalized)}f", *normalized)
+
+
+def _unpack_vector(blob: bytes, dimensions: int) -> list[float]:
+    if dimensions < 1 or len(blob) != dimensions * 4:
+        raise EmbeddingError("データベース内のEmbedding形式が不正です")
+    return list(struct.unpack(f"<{dimensions}f", blob))
+
+
+def _cached_embedding_vectors(dbfile: str | Path, model_id: str) -> dict[str, tuple[int, bytes]]:
+    connection = _connect(dbfile)
+    try:
+        rows = connection.execute(
+            """
+            SELECT e.sha1, ee.content_sha1, ee.model_id, ee.dimensions, ee.vector
+            FROM entry AS e
+            JOIN entry_embedding AS ee ON ee.entry_id = e.id
+            WHERE ee.model_id = ?
+            """,
+            (model_id,),
+        )
+        cached: dict[str, tuple[int, bytes]] = {}
+        for row in rows:
+            if row["sha1"] != row["content_sha1"]:
+                continue
+            dimensions = row["dimensions"]
+            vector = row["vector"]
+            if dimensions > 0 and len(vector) == dimensions * 4:
+                cached[row["sha1"]] = (dimensions, vector)
+        return cached
+    finally:
+        connection.close()
+
+
+def _prepare_embedding_vectors(
+    dbfile: str | Path,
+    entries: list[EntryRecord],
+    embedder: Embedder,
+) -> dict[str, tuple[int, bytes]]:
+    vectors = _cached_embedding_vectors(dbfile, embedder.model_id)
+    missing: dict[str, EntryRecord] = {}
+    for entry in entries:
+        if entry.sha1 not in vectors:
+            missing.setdefault(entry.sha1, entry)
+    if not missing:
+        return vectors
+
+    texts = [
+        _embedding_text(entry.tags, entry.title, entry.body)
+        for entry in missing.values()
+    ]
+    encoded = embedder.encode(texts)
+    if len(encoded) != len(texts):
+        raise EmbeddingError("Embeddingモデルが返した件数が一致しません")
+    for digest, vector in zip(missing, encoded):
+        vectors[digest] = _pack_vector(vector)
+    return vectors
+
+
+def _store_embedding(
+    connection: sqlite3.Connection,
+    entry_id: int,
+    digest: str,
+    model_id: str,
+    dimensions: int,
+    vector: bytes,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO entry_embedding(entry_id, content_sha1, model_id, dimensions, vector)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(entry_id) DO UPDATE SET
+            content_sha1 = excluded.content_sha1,
+            model_id = excluded.model_id,
+            dimensions = excluded.dimensions,
+            vector = excluded.vector
+        WHERE entry_embedding.content_sha1 != excluded.content_sha1
+           OR entry_embedding.model_id != excluded.model_id
+           OR entry_embedding.dimensions != excluded.dimensions
+        """,
+        (entry_id, digest, model_id, dimensions, vector),
+    )
+
+
+def _desired_entries_for_day(
+    day: DayRecord,
+    existing: dict[str, str],
+    excluded: set[str],
+) -> dict[str, EntryRecord]:
+    all_desired = {entry.source_key: entry for entry in day.entries}
+    existing_hashes = set(existing.values())
+    excluded_new_keys: set[str] = set()
+    if excluded:
+        for entry in day.entries:
+            if not _has_excluded_tag(entry.tags, excluded):
+                continue
+            previous_digest = existing.get(entry.source_key)
+            if previous_digest is None:
+                if entry.sha1 not in existing_hashes:
+                    excluded_new_keys.add(entry.source_key)
+            elif previous_digest != entry.sha1:
+                previous_digest_moved = any(
+                    other_key != entry.source_key and other.sha1 == previous_digest
+                    for other_key, other in all_desired.items()
+                )
+                if previous_digest_moved:
+                    excluded_new_keys.add(entry.source_key)
+    return {
+        source_key: entry
+        for source_key, entry in all_desired.items()
+        if source_key not in excluded_new_keys
+    }
+
+
 def sync_database(
     dbfile: str | Path,
     days: list[DayRecord],
     exclude_tags: set[str] | None = None,
+    embedder: Embedder | None = None,
 ) -> tuple[int, int, int]:
     """解析済みデータを差分同期し、(追加, 更新, 削除)件数を返す。"""
-    connection = _connect(dbfile)
     added = updated = deleted = 0
     excluded = exclude_tags or set()
     desired_dates = {day.date for day in days}
+    embedding_vectors: dict[str, tuple[int, bytes]] = {}
+    if embedder is not None:
+        read_connection = _connect(dbfile)
+        try:
+            embedding_entries: list[EntryRecord] = []
+            for day in days:
+                existing = {
+                    row["source_key"]: row["sha1"]
+                    for row in read_connection.execute(
+                        """
+                        SELECT e.source_key, e.sha1
+                        FROM entry AS e
+                        JOIN day_header AS d ON d.id = e.day_id
+                        WHERE d.date = ?
+                        """,
+                        (day.date,),
+                    )
+                }
+                embedding_entries.extend(
+                    _desired_entries_for_day(day, existing, excluded).values()
+                )
+        finally:
+            read_connection.close()
+        embedding_vectors = _prepare_embedding_vectors(dbfile, embedding_entries, embedder)
+
+    connection = _connect(dbfile)
     try:
         connection.execute("BEGIN IMMEDIATE")
         for day in days:
@@ -288,30 +513,7 @@ def sync_database(
                     "SELECT source_key, sha1 FROM entry WHERE day_id = ?", (day_id,)
                 )
             }
-            all_desired = {entry.source_key: entry for entry in day.entries}
-            existing_hashes = set(existing.values())
-            excluded_new_keys: set[str] = set()
-            if excluded:
-                for entry in day.entries:
-                    if not _has_excluded_tag(entry.tags, excluded):
-                        continue
-                    previous_digest = existing.get(entry.source_key)
-                    if previous_digest is None:
-                        if entry.sha1 not in existing_hashes:
-                            excluded_new_keys.add(entry.source_key)
-                    elif previous_digest != entry.sha1:
-                        previous_digest_moved = any(
-                            other_key != entry.source_key and other.sha1 == previous_digest
-                            for other_key, other in all_desired.items()
-                        )
-                        if previous_digest_moved:
-                            excluded_new_keys.add(entry.source_key)
-
-            desired = {
-                source_key: entry
-                for source_key, entry in all_desired.items()
-                if source_key not in excluded_new_keys
-            }
+            desired = _desired_entries_for_day(day, existing, excluded)
 
             # 位置キーがずれた場合も一意制約に抵触しないよう、差分行を先に削除する。
             keys_to_remove = [
@@ -338,6 +540,24 @@ def sync_database(
                     added += 1
                 else:
                     updated += 1
+
+            if embedder is not None:
+                for entry in desired.values():
+                    row = connection.execute(
+                        "SELECT id FROM entry WHERE source_key = ? AND sha1 = ?",
+                        (entry.source_key, entry.sha1),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    dimensions, vector = embedding_vectors[entry.sha1]
+                    _store_embedding(
+                        connection,
+                        row["id"],
+                        entry.sha1,
+                        embedder.model_id,
+                        dimensions,
+                        vector,
+                    )
 
         stale_dates = [
             row["date"]
@@ -381,86 +601,229 @@ def _like_condition(term: str) -> tuple[str, tuple[str, str, str]]:
     return condition, (pattern, pattern, pattern)
 
 
-def search_database(dbfile: str | Path, query: str, page: int, limit: int) -> SearchPage:
+def _bm25_results(connection: sqlite3.Connection, query: str) -> list[sqlite3.Row]:
+    terms = query.split()
+    long_terms = [term for term in terms if len(term) >= 3]
+    short_terms = [term for term in terms if len(term) < 3]
+    if not terms:
+        return []
+
+    short_conditions_and_params = [_like_condition(term) for term in short_terms]
+    short_where = " AND ".join(condition for condition, _ in short_conditions_and_params)
+    short_params = tuple(
+        value
+        for _, parameters in short_conditions_and_params
+        for value in parameters
+    )
+
+    if long_terms:
+        # 各語を引用してFTS5演算子を無効化し、すべての語をAND検索する。
+        fts_terms = ['"' + term.replace('"', '""') + '"' for term in long_terms]
+        fts_query = " AND ".join(fts_terms)
+        where_clause = "entry_fts MATCH ?"
+        if short_where:
+            where_clause += " AND " + short_where
+        parameters = (fts_query, *short_params)
+        return connection.execute(
+            f"""
+            SELECT e.id AS entry_id, e.source_key, d.date, d.author_name, d.author_mail,
+                   e.tags, e.title, e.body, bm25(entry_fts, 5.0, 8.0, 1.0) AS score
+            FROM entry_fts
+            JOIN entry AS e ON e.id = entry_fts.rowid
+            JOIN day_header AS d ON d.id = e.day_id
+            WHERE {where_clause}
+            ORDER BY score ASC, d.date DESC, e.source_key DESC
+            """,
+            parameters,
+        ).fetchall()
+
+    short_where = " AND ".join(condition for condition, _ in short_conditions_and_params)
+    score_placeholders = ", ".join("?" for _ in short_terms)
+    connection.create_function("short_query_rank", -1, _short_query_rank)
+    return connection.execute(
+        f"""
+        SELECT e.id AS entry_id, e.source_key, d.date, d.author_name, d.author_mail,
+               e.tags, e.title, e.body,
+               short_query_rank(e.tags, e.title, e.body, {score_placeholders}) AS score
+        FROM entry AS e
+        JOIN day_header AS d ON d.id = e.day_id
+        WHERE {short_where}
+        ORDER BY score DESC, d.date DESC, e.source_key DESC
+        """,
+        (*short_terms, *short_params),
+    ).fetchall()
+
+
+def _ensure_database_embeddings(dbfile: str | Path, embedder: Embedder) -> None:
+    connection = _connect(dbfile)
+    try:
+        rows = connection.execute(
+            """
+            SELECT e.id, e.source_key, e.sha1, e.tags, e.title, e.body,
+                   ee.content_sha1, ee.model_id, ee.dimensions, ee.vector
+            FROM entry AS e
+            LEFT JOIN entry_embedding AS ee ON ee.entry_id = e.id
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    missing: list[tuple[int, str]] = []
+    records: list[EntryRecord] = []
+    for row in rows:
+        vector_is_current = (
+            row["content_sha1"] == row["sha1"]
+            and row["model_id"] == embedder.model_id
+            and row["dimensions"] is not None
+            and row["dimensions"] > 0
+            and len(row["vector"]) == row["dimensions"] * 4
+        )
+        if vector_is_current:
+            continue
+        missing.append((row["id"], row["sha1"]))
+        records.append(
+            EntryRecord(
+                row["source_key"],
+                row["tags"],
+                row["title"],
+                row["body"],
+                row["sha1"],
+            )
+        )
+    if not missing:
+        return
+
+    vectors = _prepare_embedding_vectors(dbfile, records, embedder)
+    connection = _connect(dbfile)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for entry_id, digest in missing:
+            current = connection.execute(
+                "SELECT sha1 FROM entry WHERE id = ?", (entry_id,)
+            ).fetchone()
+            if current is None or current["sha1"] != digest:
+                continue
+            dimensions, vector = vectors[digest]
+            _store_embedding(
+                connection, entry_id, digest, embedder.model_id, dimensions, vector
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _semantic_results(
+    connection: sqlite3.Connection,
+    query: str,
+    embedder: Embedder,
+) -> list[tuple[sqlite3.Row, float]]:
+    query_vectors = embedder.encode([query])
+    if len(query_vectors) != 1:
+        raise EmbeddingError("Embeddingモデルが検索語を変換できませんでした")
+    query_vector = _normalize_vector(query_vectors[0])
+    rows = connection.execute(
+        """
+        SELECT e.id AS entry_id, e.source_key, d.date, d.author_name, d.author_mail,
+               e.tags, e.title, e.body, ee.dimensions, ee.vector
+        FROM entry AS e
+        JOIN entry_embedding AS ee ON ee.entry_id = e.id
+        JOIN day_header AS d ON d.id = e.day_id
+        WHERE ee.model_id = ? AND ee.content_sha1 = e.sha1
+        """,
+        (embedder.model_id,),
+    )
+    scored: list[tuple[sqlite3.Row, float]] = []
+    for row in rows:
+        if row["dimensions"] != len(query_vector):
+            continue
+        vector = _unpack_vector(row["vector"], row["dimensions"])
+        similarity = sum(left * right for left, right in zip(query_vector, vector))
+        if similarity >= MIN_SEMANTIC_SIMILARITY:
+            scored.append((row, similarity))
+    scored.sort(
+        key=lambda item: (
+            item[1],
+            item[0]["date"],
+            item[0]["source_key"],
+        ),
+        reverse=True,
+    )
+    return scored[:SEMANTIC_TOP_K]
+
+
+def search_database(
+    dbfile: str | Path,
+    query: str,
+    page: int,
+    limit: int,
+    mode: str = "bm25",
+    embedder: Embedder | None = None,
+) -> SearchPage:
     if page < 1:
         raise ValueError("pageは1以上を指定してください")
     if limit < 1 or limit > MAX_LIMIT:
         raise ValueError(f"limitは1〜{MAX_LIMIT}を指定してください")
+    if mode not in SEARCH_MODES:
+        raise ValueError("modeはhybridまたはbm25を指定してください")
     row_offset = (page - 1) * limit
-    terms = query.split()
-    long_terms = [term for term in terms if len(term) >= 3]
-    short_terms = [term for term in terms if len(term) < 3]
-    connection = _connect(dbfile)
-    try:
-        short_conditions_and_params = [_like_condition(term) for term in short_terms]
-        short_where = " AND ".join(condition for condition, _ in short_conditions_and_params)
-        short_params = tuple(
-            value
-            for _, parameters in short_conditions_and_params
-            for value in parameters
+    if not query.strip():
+        return SearchPage([], 0, page, limit, mode)
+
+    if mode == "bm25":
+        connection = _connect(dbfile)
+        try:
+            candidates = _bm25_results(connection, query)
+        finally:
+            connection.close()
+        return SearchPage(
+            candidates[row_offset:row_offset + limit],
+            len(candidates),
+            page,
+            limit,
+            mode,
         )
 
-        if long_terms:
-            # 各語を引用してFTS5演算子を無効化し、すべての語をAND検索する。
-            fts_terms = ['"' + term.replace('"', '""') + '"' for term in long_terms]
-            fts_query = " AND ".join(fts_terms)
-            where_clause = "entry_fts MATCH ?"
-            if short_where:
-                where_clause += " AND " + short_where
-            parameters = (fts_query, *short_params)
-            total = connection.execute(
-                f"""
-                SELECT COUNT(*)
-                FROM entry_fts
-                JOIN entry AS e ON e.id = entry_fts.rowid
-                WHERE {where_clause}
-                """,
-                parameters,
-            ).fetchone()[0]
-            rows = connection.execute(
-                f"""
-                SELECT e.source_key, d.date, d.author_name, d.author_mail,
-                       e.tags, e.title, e.body, bm25(entry_fts, 5.0, 8.0, 1.0) AS score
-                FROM entry_fts
-                JOIN entry AS e ON e.id = entry_fts.rowid
-                JOIN day_header AS d ON d.id = e.day_id
-                WHERE {where_clause}
-                ORDER BY score ASC, d.date DESC, e.source_key DESC
-                LIMIT ? OFFSET ?
-                """,
-                (*parameters, limit, row_offset),
-            ).fetchall()
-        elif short_terms:
-            short_where = " AND ".join(condition for condition, _ in short_conditions_and_params)
-            score_placeholders = ", ".join("?" for _ in short_terms)
-            total = connection.execute(
-                f"""
-                SELECT COUNT(*)
-                FROM entry AS e
-                WHERE {short_where}
-                """,
-                short_params,
-            ).fetchone()[0]
-            connection.create_function("short_query_rank", -1, _short_query_rank)
-            rows = connection.execute(
-                f"""
-                SELECT e.source_key, d.date, d.author_name, d.author_mail,
-                       e.tags, e.title, e.body,
-                       short_query_rank(e.tags, e.title, e.body, {score_placeholders}) AS score
-                FROM entry AS e
-                JOIN day_header AS d ON d.id = e.day_id
-                WHERE {short_where}
-                ORDER BY score DESC, d.date DESC, e.source_key DESC
-                LIMIT ? OFFSET ?
-                """,
-                (*short_terms, *short_params, limit, row_offset),
-            ).fetchall()
-        else:
-            total = 0
-            rows = []
-        return SearchPage(rows, total, page, limit)
+    if embedder is None:
+        raise EmbeddingError("ハイブリッド検索用のEmbeddingモデルが設定されていません")
+    _ensure_database_embeddings(dbfile, embedder)
+    connection = _connect(dbfile)
+    try:
+        keyword_candidates = _bm25_results(connection, query)
+        semantic_candidates = _semantic_results(connection, query, embedder)
     finally:
         connection.close()
+
+    candidate_rows: dict[int, sqlite3.Row] = {}
+    rrf_scores: dict[int, float] = {}
+    for rank, row in enumerate(keyword_candidates, start=1):
+        entry_id = row["entry_id"]
+        candidate_rows[entry_id] = row
+        rrf_scores[entry_id] = rrf_scores.get(entry_id, 0.0) + 1 / (RRF_K + rank)
+    for rank, (row, _) in enumerate(semantic_candidates, start=1):
+        entry_id = row["entry_id"]
+        candidate_rows[entry_id] = row
+        rrf_scores[entry_id] = rrf_scores.get(entry_id, 0.0) + 1 / (RRF_K + rank)
+
+    ranked_ids = sorted(
+        candidate_rows,
+        key=lambda entry_id: (
+            rrf_scores[entry_id],
+            candidate_rows[entry_id]["date"],
+            candidate_rows[entry_id]["source_key"],
+        ),
+        reverse=True,
+    )
+    ordered_rows = [dict(candidate_rows[entry_id]) for entry_id in ranked_ids]
+    return SearchPage(
+        ordered_rows[row_offset:row_offset + limit],
+        len(ordered_rows),
+        page,
+        limit,
+        mode,
+    )
 
 
 def _trim_url_punctuation(value: str) -> tuple[str, str]:
@@ -501,8 +864,10 @@ def linkify(text: str) -> str:
     return "".join(pieces)
 
 
-def _pagination_link(query: str, page: int, limit: int, label: str) -> str:
-    target = "/search?" + urlencode({"q": query, "page": page, "limit": limit})
+def _pagination_link(query: str, page: int, limit: int, mode: str, label: str) -> str:
+    target = "/search?" + urlencode(
+        {"q": query, "page": page, "limit": limit, "mode": mode}
+    )
     return f'<a href="{html.escape(target, quote=True)}">{html.escape(label)}</a>'
 
 
@@ -523,6 +888,15 @@ def render_search_page(query: str, result: SearchPage) -> str:
         '<form action="/search" method="get" class="search-form">',
         f'<input type="search" name="q" value="{safe_query}" aria-label="検索語">',
         '<input type="hidden" name="limit" value="{}">'.format(result.limit),
+        '<label for="search-mode">検索方式</label>',
+        '<select id="search-mode" name="mode">',
+        '<option value="hybrid"{}>ハイブリッド</option>'.format(
+            " selected" if result.mode == "hybrid" else ""
+        ),
+        '<option value="bm25"{}>BM25のみ</option>'.format(
+            " selected" if result.mode == "bm25" else ""
+        ),
+        "</select>",
         '<button type="submit">検索</button>',
         "</form>",
     ]
@@ -557,11 +931,15 @@ def render_search_page(query: str, result: SearchPage) -> str:
     if result.total > result.limit:
         parts.append('<nav class="pagination" aria-label="ページ移動">')
         if result.page > 1:
-            parts.append(_pagination_link(query, result.page - 1, result.limit, "前へ"))
+            parts.append(
+                _pagination_link(query, result.page - 1, result.limit, result.mode, "前へ")
+            )
         last_page = (result.total + result.limit - 1) // result.limit
         parts.append(f"<span>{result.page} / {last_page}</span>")
         if result.page < last_page:
-            parts.append(_pagination_link(query, result.page + 1, result.limit, "次へ"))
+            parts.append(
+                _pagination_link(query, result.page + 1, result.limit, result.mode, "次へ")
+            )
         parts.append("</nav>")
     parts.extend(["</main>", "</body>", "</html>"])
     return "\n".join(parts)
@@ -587,12 +965,14 @@ class SourceWatcher(threading.Thread):
         dbfile: Path,
         initial_digest: str,
         exclude_tags: set[str] | None = None,
+        embedder: Embedder | None = None,
     ):
         super().__init__(name="clms-source-watcher", daemon=True)
         self.source = source
         self.dbfile = dbfile
         self.digest = initial_digest
         self.exclude_tags = exclude_tags or set()
+        self.embedder = embedder
         self.pending_digest: str | None = None
         self.stop_event = threading.Event()
 
@@ -607,20 +987,27 @@ class SourceWatcher(threading.Thread):
                     self.pending_digest = digest
                     continue
                 days = parse_source(text)
-                changes = sync_database(self.dbfile, days, self.exclude_tags)
+                changes = sync_database(
+                    self.dbfile, days, self.exclude_tags, self.embedder
+                )
                 self.digest = digest
                 self.pending_digest = None
                 LOGGER.info(
                     "ソースを同期しました (追加 %d、更新 %d、削除 %d)", *changes
                 )
-            except (OSError, UnicodeError, MemoFormatError, sqlite3.Error) as exc:
+            except (OSError, UnicodeError, MemoFormatError, RuntimeError, sqlite3.Error) as exc:
                 LOGGER.warning("ソース更新を反映できませんでした: %s", exc)
 
     def stop(self) -> None:
         self.stop_event.set()
 
 
-def make_handler(dbfile: Path, cssfile: Path) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    dbfile: Path,
+    cssfile: Path,
+    default_mode: str = DEFAULT_SEARCH_MODE,
+    embedder: Embedder | None = None,
+) -> type[BaseHTTPRequestHandler]:
     class ClmsRequestHandler(BaseHTTPRequestHandler):
         server_version = "CLMS/1.0"
 
@@ -656,13 +1043,17 @@ def make_handler(dbfile: Path, cssfile: Path) -> type[BaseHTTPRequestHandler]:
 
             parameters = parse_qs(request.query, keep_blank_values=True, encoding="utf-8")
             query = parameters.get("q", [""])[0]
+            mode = parameters.get("mode", [default_mode])[0]
             try:
                 page = int(parameters.get("page", ["1"])[0])
                 limit = int(parameters.get("limit", ["10"])[0])
-                result = search_database(dbfile, query, page, limit)
+                result = search_database(dbfile, query, page, limit, mode, embedder)
             except ValueError as exc:
                 message = f"不正なリクエストです: {exc}"
                 self._send(400, "text/plain; charset=utf-8", message.encode("utf-8"))
+                return
+            except EmbeddingError as exc:
+                self._send(503, "text/plain; charset=utf-8", str(exc).encode("utf-8"))
                 return
             except sqlite3.Error:
                 LOGGER.exception("検索に失敗しました")
@@ -698,12 +1089,24 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="新規登録しないタグ (カンマ区切り)",
     )
+    parser.add_argument(
+        "--search-mode",
+        choices=SEARCH_MODES,
+        default=DEFAULT_SEARCH_MODE,
+        help="検索方式の既定値 (hybrid または bm25)",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=DEFAULT_EMBEDDING_MODEL,
+        help="sentence-transformersのモデル名またはローカルパス",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     source = Path(args.source).expanduser().resolve()
     dbfile = Path(args.dbfile).expanduser().resolve()
     exclude_tags = parse_exclude_tags(args.exclude_tags)
+    embedder = SentenceTransformerEmbedder(args.embedding_model)
     if source == dbfile:
         parser.error("--sourceと--dbfileには異なるファイルを指定してください")
     if not source.is_file():
@@ -713,16 +1116,28 @@ def main(argv: list[str] | None = None) -> int:
         text, digest = _read_source(source)
         days = parse_source(text)
         initialize_database(dbfile)
-        changes = sync_database(dbfile, days, exclude_tags)
+        changes = sync_database(
+            dbfile,
+            days,
+            exclude_tags,
+            embedder if args.search_mode == "hybrid" else None,
+        )
     except (OSError, UnicodeError, MemoFormatError, RuntimeError, sqlite3.Error) as exc:
         parser.error(str(exc))
     LOGGER.info("初期同期しました (追加 %d、更新 %d、削除 %d)", *changes)
 
     cssfile = Path(__file__).with_name("clms.css")
-    watcher = SourceWatcher(source, dbfile, digest, exclude_tags)
+    watcher = SourceWatcher(
+        source,
+        dbfile,
+        digest,
+        exclude_tags,
+        embedder if args.search_mode == "hybrid" else None,
+    )
     try:
         server = ThreadingHTTPServer(
-            (LOOPBACK_HOST, args.port), make_handler(dbfile, cssfile)
+            (LOOPBACK_HOST, args.port),
+            make_handler(dbfile, cssfile, args.search_mode, embedder),
         )
     except OSError as exc:
         LOGGER.error(
