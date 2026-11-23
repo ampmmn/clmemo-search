@@ -1,77 +1,154 @@
-# vim-clmemo-grep
+# ChangeLogメモ検索（CLMS）
 
-[README in Japsnese](README-ja.md)
+## この文書について
 
-## Description
+このREADMEは、別セッションでこのアプリを保守するコーディングエージェント向けの仕様・設計メモです。機能追加やバグ修正時に、現在の実装上の前提と注意点を確認するために使用してください。
 
-A vim plugin for grepping 'Changelog Memo'.
-Changelog Memo is a kind of concept that writting memo into one text file.
-For more details, see http://0xcc.net/unimag/1/ (written in Japanese).
+## アプリの概要
 
-![](image/intro.gif)
+`clms.py` は、ChangeLog形式のテキストメモをSQLiteデータベースに同期し、FTS5で検索するローカルHTTPサーバーです。検索結果はHTMLで返し、スタイルは `clms.css` で変更できます。
 
-## Getting Started
+- Python標準ライブラリのみを使用します。
+- Python 3.10以降を想定します。
+- SQLiteがFTS5および `trigram` tokenizerに対応している必要があります。未対応の場合は起動時にエラーになります。
+- サーバーはIPv4ループバックアドレス `127.0.0.1` のみで待ち受けます。
 
-### Installation
+## 起動方法
 
-Installation is as well as other usual plugins.
-Download zip file on github, extract it and place ~/.vim or ~/vimfiles.
-
-### Usage
-
-Once this installation is done, you can use the following commands.
-
-`CLMemoGrep` / `CLMemoGrepReverse` / `CLMemoCalendarSign`
-
-- `CLMemoGrep`
-  -  searchs for the given words in the 'Changelog Memo' file.
-
-```
-:CLMemoGrep keyword1 keyword2 ...
+```powershell
+python clms.py --source "memo.txt" --dbfile "memo.sqlite3" --port 18080
 ```
 
-- `CLMemoGrepReverse`
-    is same as CLMemoGrep. But the result is listed in resersed order.
+除外タグを指定する場合:
 
-```
-:CLMemoGrepReverse keyword1 keyword2 ...
-```
-
-- `CLMemoCalendarSign`
-  -  searchs for the given words in the 'Changelog Memo' file. The result is marked on the calendar if [calendar-vim](https://github.com/mattn/calendar-vim) is installed.
-
-```
-:CLMemoGrepCalendarSign keyword1 keyword2 ...
+```powershell
+python clms.py --source "memo.txt" --dbfile "memo.sqlite3" --port 18080 --exclude-tags=private,skip
 ```
 
-### Variables
+起動後、ブラウザーで `http://127.0.0.1:18080/` を開きます。`--host` オプションはありません。ループバック以外のアドレスから来た要求は、リクエストハンドラーでも拒否します。
 
-- `g:clmemogrep_changelogfilepath`
-  - Specifies file path of the ChanegLog memo.
+| 引数 | 必須 | 説明 |
+| --- | --- | --- |
+| `--source` | はい | UTF-8のChangeLogメモファイル |
+| `--dbfile` | はい | SQLiteデータベースファイル |
+| `--port` | はい | 待ち受けポート（1〜65535） |
+| `--exclude-tags` | いいえ | カンマ区切りの除外タグ。例: `--exclude-tags=private,skip` |
 
-- `g:clmemogrep_fileencoding`
-  - Specifies encoding of the ChanegLog memo.
+起動時にソースを解析・同期してからサーバーを開始します。ポートのバインドに失敗した場合は、バックトレースではなくエラーログを出し、異常終了します。初期同期後のポートエラーでも、同期済みデータベースは残ります。
 
-- `g:clmemogrep_setfocus` (1 or 0)
-  - Move focus to the search results window.
+## メモファイル形式
 
-- `g:clmemogrep_fold` (1 or 0)
-  - Specifies whether the results should be folded or not.
+日付ヘッダー:
 
-- `g:clmemogrep_showheader` (1 or 0)
-  - Display the number of hits in the search results.
+```text
+YYYY-MM-DD Name <mail-address>
+```
 
-- `g:clmemogrep_showdate` (1 or 0)
-  - Specifies whether to display dates in search results.
+エントリはタブとアスタリスクで始めます。コロンがある場合、コロンより前がカンマ区切りのタグ、後ろがタイトルです。コロンがなければタグなしエントリで、アスタリスク以降がタイトルになります。
 
-- `g:clmemogrep_Split`
-  - Specifies how to split the search result window.
-    - '' : horihontal
-    - `v' : vertical
+```text
+2026-11-23 Name <mail-address>
+	* tag1,tag2 : タイトルあり
+	本文の1行目
+	本文の2行目
 
+	* タグなしタイトル
+	タグなしエントリの本文
+```
 
-## Requirements
+解析ルール:
 
-`+python3/dyn' feature is needed to use this plugin.
+- 日付は実在する `YYYY-MM-DD` 形式である必要があります。同じ日付のヘッダーを複数回記述することはできません。
+- 一つの日付にエントリが0件でも構いません。
+- タグ、タイトルの前後空白を除去します。保存する複数タグの区切りは `, ` です。
+- エントリ本文の各行はタブで始めます。解析時に先頭のタブを1つ取り除きます。
+- タブだけの行は本文中の空行として保存されます。
+- タブのない空行は次の行を見て判定します。次が日付ヘッダーまたはタブ始まりの `*` 行ならエントリ区切りです。それ以外で本文行が続く場合、空行を本文に保持します。
+- 空行後のタブ始まり本文行は、コロンを含んでいても本文です。
+- 不正な日付、日付ヘッダーより前のエントリ、タブで始まらない本文などは解析エラーになります。
+- ファイルは `utf-8-sig` として読み込むため、UTF-8 BOMの有無を許容します。
 
+### エントリ位置キー
 
+エントリには `YYYY-MM-DD_NNN` 形式の `source_key` を割り当てます。その日付の最下部が `_001` で、上に行くほど番号が増えます。
+
+元ファイルに明示的なエントリIDがないため、キーは位置に基づきます。同じ日の末尾への追加などで位置がずれると、既存エントリのキーも変化し、複数エントリが更新扱いになることがあります。この制約は現行仕様です。
+
+## データベースと同期
+
+主なテーブル:
+
+- `day_header`: 日付、作成者名・メール、日単位SHA-1。
+- `entry`: `day_id`、`source_key`、タグ、タイトル、本文、エントリSHA-1。
+- `entry_fts`: `entry` を外部コンテンツとするFTS5テーブル。`tags`、`title`、`body` を `trigram` tokenizerで索引付けします。
+
+`entry` の追加・更新・削除はSQLiteトリガーで `entry_fts` に反映します。FTSの列、tokenizer、トリガーを変更する場合は、既存DBとの互換性と索引再構築の要否を検討してください。
+
+同期処理:
+
+1. 起動時にファイル全体を解析し、SQLiteトランザクション内で同期します。
+2. 日付・位置キー・SHA-1を比較して追加、変更、削除を反映します。
+3. ソースファイルを2秒間隔で読みます。内容SHA-1の変更を連続した確認で検出してから同期し、書き込み途中の一時状態を避けます。
+4. 同期失敗時はトランザクションをロールバックし、警告を出して次の監視周期に再試行します。
+
+### 除外タグ
+
+`--exclude-tags` はカンマ区切りで解析し、タグの前後空白を除去して `casefold()` で比較します。大文字・小文字を区別しません。エントリに指定タグが一つでもあれば、新規レコードの追加を除外します。初回同期とファイル監視後の同期の両方に適用します。
+
+オプションを追加したことだけを理由に、既存DBのエントリを一括削除しません。そのため、以前登録済みの除外対象エントリは検索結果に残る場合があります。既存レコードの通常の更新や、ソースから消えたレコードの削除は従来の差分同期どおりです。
+
+位置キーが移動する同期では、除外対象の新規エントリと既存行の移動を区別するため、同一日付内のSHA-1も照合します。重複した同一内容エントリなど、元ファイルにIDがないことによる曖昧さは残ります。
+
+## 検索仕様
+
+```text
+/search?q={query}&page={page}&limit={limit}
+```
+
+- `q`: UTF-8の検索語。空白区切りの語はAND条件で、すべてを含むエントリが対象です。分割はPythonの `str.split()` に従います。
+- `page`: 1始まりのページ番号。既定値は `1`。
+- `limit`: 1ページの件数。既定値は `10`、最大値は `100`。
+- SQLの行オフセットは `(page - 1) * limit` です。
+- タグ、タイトル、本文を検索対象とします。
+
+### 日本語検索と順位
+
+- 3文字以上の各検索語はFTS5 `trigram` で検索します。利用者入力は個別に引用し、FTS5演算子として解釈されないようにします。各語は `AND` で結合します。
+- BM25の列重みは `tags=5.0`、`title=8.0`、`body=1.0` です。BM25値が小さい順に表示します。
+- 1〜2文字の語はtrigramの制限を補うためLIKE部分一致で検索します。長い語と混在する場合も短い語をAND条件にし、順位は長い語に対するBM25です。
+- すべて1〜2文字の場合は、出現数に基づく簡易順位を使用します（タグ×5、タイトル×4、本文×1）。この場合はBM25ではありません。
+- LIKE検索では `%`、`_`、`!` をエスケープします。
+
+## HTTP・HTML・CSS
+
+- `ThreadingHTTPServer` を `127.0.0.1` のみで待ち受けます。
+- リクエスト元IPも検査し、ループバック以外には403を返します。
+- `/` と `/search` は検索HTML、`/style.css` は同じディレクトリの `clms.css` を返します。
+- タイトル、タグ、本文をHTMLエスケープして表示します。
+- `http://`、`https://`、`www.` で始まる記述はリンク化します。`www.` には `https://` を補い、HTTP(S)以外のスキームはリンク化しません。
+- HTMLにはCSPと `X-Content-Type-Options: nosniff` を付与します。
+- 外観変更は原則 `clms.css` で行います。
+
+## コード構成と保守時の注意
+
+- `clms.py`: パーサー、SQLite/FTS5初期化・同期、検索、HTML生成、HTTPサーバー、CLI。
+- `clms.css`: HTMLレポートのスタイル。
+- `test_clms.py`: 標準ライブラリ `unittest` によるパーサー、同期、検索、HTML、HTTP、CLI、ネットワーク制約のテスト。
+
+変更時の注意:
+
+- 区切り判定の変更では、タブだけの行、真の空行、空行後の本文、空行後の次エントリをテストしてください。
+- `source_key` は位置ベースです。パーサーやエントリ数の扱いを変更すると既存DBの差分判定に影響します。
+- 除外タグは初回同期と `SourceWatcher` の両方に渡します。片方だけ変更すると、起動時と監視時の挙動が異なります。
+- HTMLに新しいデータを追加する際は必ずエスケープし、リンク化ではHTTP(S)以外を許可しないでください。
+- 個人メモ用途のため、サーバーの待ち受け先を変更せずループバック限定を維持してください。
+
+## テスト
+
+リポジトリのルートで実行します。
+
+```powershell
+python -B -m unittest -v
+```
+
+FTS5の `trigram` tokenizerを含むSQLiteが必要です。未対応環境ではデータベース初期化テストやアプリ起動が失敗します。
