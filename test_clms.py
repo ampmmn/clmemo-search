@@ -200,6 +200,45 @@ class HtmlTests(unittest.TestCase):
         self.assertIn('href="https://example.com/a(b)"', rendered)
         self.assertTrue(rendered.endswith("</a>."))
 
+    def test_render_search_page_separates_code_blocks_and_shows_language(self):
+        result = clms.SearchPage(
+            rows=[
+                {
+                    "date": "2026-11-23",
+                    "author_name": "山田太郎",
+                    "author_mail": "",
+                    "title": "コード例",
+                    "tags": "",
+                    "body": (
+                        "説明 https://example.com\n"
+                        "```python\n"
+                        "print('<script>')\n"
+                        "https://example.org\n"
+                        "```\n"
+                        "続きの説明"
+                    ),
+                }
+            ],
+            total=1,
+            page=1,
+            limit=10,
+        )
+
+        rendered = clms.render_search_page("", result)
+
+        self.assertIn('<div class="code-language">python</div>', rendered)
+        self.assertIn("print(&#x27;&lt;script&gt;&#x27;)", rendered)
+        self.assertIn('href="https://example.com"', rendered)
+        self.assertNotIn('href="https://example.org"', rendered)
+        self.assertIn('<div class="entry-body-text">続きの説明</div>', rendered)
+
+    def test_unclosed_code_fence_continues_to_end_of_body(self):
+        rendered = clms.render_entry_body("```text\n<unsafe>\n")
+
+        self.assertIn('<div class="code-language">text</div>', rendered)
+        self.assertIn("&lt;unsafe&gt;", rendered)
+        self.assertNotIn("entry-body-text", rendered)
+
 
 class HttpTests(unittest.TestCase):
     def test_search_and_css_endpoints(self):

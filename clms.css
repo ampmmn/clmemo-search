@@ -66,8 +66,37 @@ h1 {
 }
 
 .entry-body {
+    min-width: 0;
+}
+
+.entry-body-text {
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+}
+
+.code-block {
+    margin: 0.8rem 0;
+}
+
+.code-language {
+    margin-bottom: 0.25rem;
+    color: GrayText;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 0.85rem;
+}
+
+.code-block pre {
+    max-width: 100%;
+    margin: 0;
+    padding: 0.8rem 1rem;
+    overflow-x: auto;
+    border-radius: 0.35rem;
+    background: color-mix(in srgb, CanvasText 8%, Canvas);
+    white-space: pre;
+}
+
+.code-block code {
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
 }
 
 a {

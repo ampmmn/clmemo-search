@@ -37,6 +37,8 @@ HEADER_RE = re.compile(
 )
 ENTRY_RE = re.compile(r"^\t\*\s*(?P<content>.*)$")
 URL_RE = re.compile(r"(?i)(?<![\w@])(?:https?://|www\.)[^\s<>\"']+")
+CODE_FENCE_OPEN_RE = re.compile(r"^\s*```(?P<language>[^`]*)\s*$")
+CODE_FENCE_CLOSE_RE = re.compile(r"^\s*```\s*$")
 TRAILING_URL_PUNCTUATION = ".,!?;:。、，．！？；：…」』》〉»”’"
 URL_BRACKET_PAIRS = ((")", "("), ("]", "["), ("}", "{"), ("）", "（"), ("】", "【"))
 
@@ -864,6 +866,62 @@ def linkify(text: str) -> str:
     return "".join(pieces)
 
 
+def render_entry_body(body: str) -> str:
+    """本文を通常テキストと三連バッククォートのコードブロックに分けて描画する。"""
+    parts: list[str] = []
+    text_lines: list[str] = []
+    code_lines: list[str] = []
+    code_language: str | None = None
+    in_code_block = False
+
+    def flush_text() -> None:
+        if text_lines:
+            parts.append(
+                f'<div class="entry-body-text">{linkify("".join(text_lines))}</div>'
+            )
+            text_lines.clear()
+
+    def flush_code() -> None:
+        language_label = ""
+        if code_language:
+            language_label = (
+                f'<div class="code-language">{html.escape(code_language)}</div>'
+            )
+        parts.append(
+            '<div class="code-block">'
+            f"{language_label}"
+            f"<pre><code>{html.escape(''.join(code_lines))}</code></pre>"
+            "</div>"
+        )
+        code_lines.clear()
+
+    for raw_line in body.splitlines(keepends=True):
+        line = raw_line.removesuffix("\n").removesuffix("\r")
+        if in_code_block:
+            if CODE_FENCE_CLOSE_RE.fullmatch(line):
+                flush_code()
+                code_language = None
+                in_code_block = False
+            else:
+                code_lines.append(raw_line)
+            continue
+
+        opening = CODE_FENCE_OPEN_RE.fullmatch(line)
+        if opening:
+            flush_text()
+            code_language = opening.group("language").strip() or None
+            in_code_block = True
+            continue
+
+        text_lines.append(raw_line)
+
+    if in_code_block:
+        flush_code()
+    else:
+        flush_text()
+    return "".join(parts)
+
+
 def _pagination_link(
     query: str, page: int, limit: int, mode: str, label: str, relation: str
 ) -> str:
@@ -929,7 +987,7 @@ def render_search_page(query: str, result: SearchPage) -> str:
                 "</header>",
                 f'<h2>{linkify(row["title"])}</h2>',
                 f'<p class="tags">{linkify(row["tags"])}</p>',
-                f'<div class="entry-body">{linkify(row["body"])}</div>',
+                f'<div class="entry-body">{render_entry_body(row["body"])}</div>',
                 "</article>",
             ]
         )
