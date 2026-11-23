@@ -30,7 +30,7 @@ SEARCH_MODES = ("hybrid", "bm25")
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 RRF_K = 60
 SEMANTIC_TOP_K = 100
-MIN_SEMANTIC_SIMILARITY = 0.60
+MIN_SEMANTIC_SIMILARITY = 0.70
 
 HEADER_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<author>.*?)\s+<(?P<mail>[^<>]*)>\s*$"
@@ -864,11 +864,16 @@ def linkify(text: str) -> str:
     return "".join(pieces)
 
 
-def _pagination_link(query: str, page: int, limit: int, mode: str, label: str) -> str:
+def _pagination_link(
+    query: str, page: int, limit: int, mode: str, label: str, relation: str
+) -> str:
     target = "/search?" + urlencode(
         {"q": query, "page": page, "limit": limit, "mode": mode}
     )
-    return f'<a href="{html.escape(target, quote=True)}">{html.escape(label)}</a>'
+    return (
+        f'<a rel="{relation}" href="{html.escape(target, quote=True)}">'
+        f"{html.escape(label)}</a>"
+    )
 
 
 def render_search_page(query: str, result: SearchPage) -> str:
@@ -881,6 +886,7 @@ def render_search_page(query: str, result: SearchPage) -> str:
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
         "<title>ChangeLogメモ検索</title>",
         '<link rel="stylesheet" href="/style.css">',
+        '<script src="/shortcuts.js" defer></script>',
         "</head>",
         "<body>",
         '<main class="container">',
@@ -932,13 +938,17 @@ def render_search_page(query: str, result: SearchPage) -> str:
         parts.append('<nav class="pagination" aria-label="ページ移動">')
         if result.page > 1:
             parts.append(
-                _pagination_link(query, result.page - 1, result.limit, result.mode, "前へ")
+                _pagination_link(
+                    query, result.page - 1, result.limit, result.mode, "前へ", "prev"
+                )
             )
         last_page = (result.total + result.limit - 1) // result.limit
         parts.append(f"<span>{result.page} / {last_page}</span>")
         if result.page < last_page:
             parts.append(
-                _pagination_link(query, result.page + 1, result.limit, result.mode, "次へ")
+                _pagination_link(
+                    query, result.page + 1, result.limit, result.mode, "次へ", "next"
+                )
             )
         parts.append("</nav>")
     parts.extend(["</main>", "</body>", "</html>"])
@@ -1036,6 +1046,18 @@ def make_handler(
                     self._send(404, "text/plain; charset=utf-8", "CSSが見つかりません。".encode("utf-8"))
                     return
                 self._send(200, "text/css; charset=utf-8", css)
+                return
+            if request.path == "/shortcuts.js":
+                try:
+                    script = Path(__file__).with_name("clms.js").read_bytes()
+                except OSError:
+                    self._send(
+                        404,
+                        "text/plain; charset=utf-8",
+                        "JavaScriptが見つかりません。".encode("utf-8"),
+                    )
+                    return
+                self._send(200, "application/javascript; charset=utf-8", script)
                 return
             if request.path not in ("/", "/search"):
                 self._send(404, "text/plain; charset=utf-8", "Not Found".encode("utf-8"))

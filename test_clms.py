@@ -224,8 +224,20 @@ class HttpTests(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                     self.assertIn("SQLiteの検索機能", page)
                     self.assertIn("次へ", page)
+                    self.assertIn('<script src="/shortcuts.js" defer></script>', page)
+                    self.assertIn('rel="next"', page)
                     self.assertIn('option value="hybrid" selected', page)
                     self.assertIn("mode=hybrid", page)
+                with urlopen(f"{base_url}/search?q=SQLite&page=2&limit=1") as response:
+                    page = response.read().decode("utf-8")
+                    self.assertIn('rel="prev"', page)
+                with urlopen(f"{base_url}/shortcuts.js") as response:
+                    script = response.read().decode("utf-8")
+                    self.assertEqual(
+                        response.headers.get_content_type(), "application/javascript"
+                    )
+                    self.assertIn('event.code === "KeyJ"', script)
+                    self.assertIn('event.code === "Comma"', script)
                 with urlopen(f"{base_url}/search?q=SQLite&mode=bm25") as response:
                     page = response.read().decode("utf-8")
                     self.assertIn('option value="bm25" selected', page)

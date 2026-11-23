@@ -173,6 +173,7 @@ YYYY-MM-DD Name <mail-address>
 - `ThreadingHTTPServer` を `127.0.0.1` のみで待ち受けます。
 - リクエスト元IPも検査し、ループバック以外には403を返します。
 - `/` と `/search` は検索HTML、`/style.css` は同じディレクトリの `clms.css` を返します。
+- `/shortcuts.js` は検索結果のキーボード操作を行うJavaScriptを返します。Alt+J / Alt+Kでエントリ間を移動し、Shift+, / Shift+. でページを移動します。入力欄などにフォーカスがある場合は無効です。
 - タイトル、タグ、本文をHTMLエスケープして表示します。
 - `http://`、`https://`、`www.` で始まる記述はリンク化します。`www.` には `https://` を補い、HTTP(S)以外のスキームはリンク化しません。
 - HTMLにはCSPと `X-Content-Type-Options: nosniff` を付与します。
@@ -181,6 +182,7 @@ YYYY-MM-DD Name <mail-address>
 ## コード構成と保守時の注意
 
 - `clms.py`: パーサー、SQLite/FTS5初期化・同期、検索、HTML生成、HTTPサーバー、CLI。
+- `clms.js`: 検索結果のエントリ移動とページ送りのキーボードショートカット。
 - `clms.css`: HTMLレポートのスタイル。
 - `requirements-embedding.txt`: ハイブリッド検索で使う任意依存関係。
 - `test_clms.py`: 標準ライブラリ `unittest` によるパーサー、同期、BM25/ハイブリッド検索、HTML、HTTP、CLI、ネットワーク制約のテスト。Embedding検索は決定的なテスト用モデルで検証し、実モデルのダウンロードに依存しません。
