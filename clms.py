@@ -35,7 +35,7 @@ MIN_SEMANTIC_SIMILARITY = 0.70
 HEADER_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<author>.*?)\s+<(?P<mail>[^<>]*)>\s*$"
 )
-ENTRY_RE = re.compile(r"^\t\*\s*(?P<content>.*)$")
+ENTRY_RE = re.compile(r"^[ \t]+\*\s*(?P<content>.*)$")
 URL_RE = re.compile(r"(?i)(?<![\w@])(?:https?://|www\.)[^\s<>\"']+")
 CODE_FENCE_OPEN_RE = re.compile(r"^\s*```(?P<language>[^`]*)\s*$")
 CODE_FENCE_CLOSE_RE = re.compile(r"^\s*```\s*$")
@@ -170,15 +170,28 @@ def parse_source(text: str) -> list[DayRecord]:
 
         header_match = HEADER_RE.fullmatch(line)
         if header_match:
-            finish_entry()
-            pending_blank_lines = 0
             date_text = header_match.group("date")
             try:
                 dt.date.fromisoformat(date_text)
-            except ValueError as exc:
-                raise MemoFormatError(f"{line_number}行目: 不正な日付です: {date_text}") from exc
+            except ValueError:
+                LOGGER.warning("%d行目: 不正な日付を無視します: %s", line_number, date_text)
+                continue
+            finish_entry()
+            pending_blank_lines = 0
             if date_text in day_by_date:
-                raise MemoFormatError(f"{line_number}行目: 日付が重複しています: {date_text}")
+                day = day_by_date[date_text]
+                author_name = header_match.group("author").strip()
+                author_mail = header_match.group("mail").strip()
+                if (author_name, author_mail) != (day.author_name, day.author_mail):
+                    LOGGER.warning(
+                        "%d行目: 日付が重複しています: %s (最初の作者情報を使用)",
+                        line_number,
+                        date_text,
+                    )
+                else:
+                    LOGGER.warning("%d行目: 日付が重複しています: %s", line_number, date_text)
+                current_day = day
+                continue
             author_name = header_match.group("author").strip()
             author_mail = header_match.group("mail").strip()
             day = DayRecord(
@@ -195,7 +208,8 @@ def parse_source(text: str) -> list[DayRecord]:
         entry_match = ENTRY_RE.fullmatch(line)
         if entry_match:
             if current_day is None:
-                raise MemoFormatError(f"{line_number}行目: 日付ヘッダーより前にエントリがあります")
+                LOGGER.warning("%d行目: 日付ヘッダーより前のエントリを無視します", line_number)
+                continue
             finish_entry()
             pending_blank_lines = 0
             content = entry_match.group("content").strip()
@@ -203,8 +217,7 @@ def parse_source(text: str) -> list[DayRecord]:
                 raw_tags, title = content.split(":", 1)
                 raw_tags = raw_tags.strip()
                 tag_list = [tag.strip() for tag in raw_tags.split(",")] if raw_tags else []
-                if any(not tag for tag in tag_list):
-                    raise MemoFormatError(f"{line_number}行目: タグの指定が不正です")
+                tag_list = [tag for tag in tag_list if tag]
                 tags = ", ".join(tag_list)
                 title = title.strip()
             else:
@@ -217,15 +230,21 @@ def parse_source(text: str) -> list[DayRecord]:
             body_lines = []
             continue
 
-        if line.startswith("\t"):
+        if line.startswith(("\t", " ")):
+            if current_day is None:
+                LOGGER.warning("%d行目: 日付ヘッダーより前の行を無視します", line_number)
+                continue
             if current_entry is None:
-                raise MemoFormatError(f"{line_number}行目: エントリ本文の位置が不正です")
-            body_lines.extend([""] * pending_blank_lines)
+                current_entry = {"tags": "", "title": ""}
+                body_lines = []
+                pending_blank_lines = 0
+            else:
+                body_lines.extend([""] * pending_blank_lines)
             pending_blank_lines = 0
             body_lines.append(line[1:])
             continue
 
-        raise MemoFormatError(f"{line_number}行目: 日付ヘッダーまたはタブ始まりのエントリが必要です")
+        LOGGER.warning("%d行目: 想定外の形式を無視します: %s", line_number, line)
 
     finish_entry()
 

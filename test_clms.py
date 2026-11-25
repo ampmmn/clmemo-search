@@ -51,9 +51,77 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(days[0].entries[0].tags, "開発, Python")
         self.assertIn("https://example.com/docs.", days[0].entries[0].body)
 
-    def test_rejects_entry_before_day_header(self):
-        with self.assertRaises(clms.MemoFormatError):
-            clms.parse_source("\t* tag : title\n\tbody\n")
+    def test_ignores_entry_before_day_header_with_warning(self):
+        with self.assertLogs(clms.LOGGER, level="WARNING") as messages:
+            days = clms.parse_source("\t* tag : title\n\tbody\n")
+        self.assertEqual(days, [])
+        self.assertTrue(any("日付ヘッダーより前" in message for message in messages.output))
+
+    def test_repeated_dates_merge_entries_and_keep_first_author(self):
+        source = (
+            "2026-11-23 新しい作者 <new@example.com>\n"
+            "\t* first : 最初のエントリ\n"
+            "\tbody-first\n"
+            "2026-11-22 別の日 <other@example.com>\n"
+            "\t* middle : 別の日のエントリ\n"
+            "2026-11-23 古い作者 <old@example.com>\n"
+            " * second : 2番目のエントリ\n"
+            " body-second\n"
+        )
+        with self.assertLogs(clms.LOGGER, level="WARNING") as messages:
+            days = clms.parse_source(source)
+
+        self.assertEqual([day.date for day in days], ["2026-11-23", "2026-11-22"])
+        self.assertEqual(days[0].author_name, "新しい作者")
+        self.assertEqual(days[0].author_mail, "new@example.com")
+        self.assertEqual([entry.title for entry in days[0].entries], ["最初のエントリ", "2番目のエントリ"])
+        self.assertEqual([entry.source_key for entry in days[0].entries], ["2026-11-23_002", "2026-11-23_001"])
+        self.assertEqual(days[0].entries[1].body, "body-second")
+        self.assertTrue(any("最初の作者情報を使用" in message for message in messages.output))
+
+    def test_headerless_entries_spaces_and_empty_tags(self):
+        source = (
+            "2026-11-23 山田太郎 <yamada@example.com>\n"
+            "   \n"
+            "  本文の前半\n"
+            "\t本文の後半\n"
+            " * tag,, : 見出しあり\n"
+            " 行頭スペースの本文\n"
+            "2026-11-22 次の日 <next@example.com>\n"
+            "  次の日の本文\n"
+            "2026-11-21 空の日 <empty@example.com>\n"
+        )
+        days = clms.parse_source(source)
+        entries = days[0].entries
+
+        self.assertEqual(len(days), 3)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0].tags, "")
+        self.assertEqual(entries[0].title, "")
+        self.assertEqual(entries[0].body, " 本文の前半\n本文の後半")
+        self.assertEqual(entries[1].tags, "tag")
+        self.assertEqual(entries[1].title, "見出しあり")
+        self.assertEqual(entries[1].body, "行頭スペースの本文")
+        self.assertEqual(days[1].entries[0].title, "")
+        self.assertEqual(days[1].entries[0].body, " 次の日の本文")
+        self.assertEqual(days[2].entries, [])
+
+    def test_unexpected_lines_warn_and_body_continues(self):
+        source = (
+            "2026-11-23 山田太郎 <yamada@example.com>\n"
+            "\t* tag : title\n"
+            "\t前半\n"
+            "想定外の行\n"
+            "2026-02-30 不正日付 <invalid@example.com>\n"
+            "\t後半\n"
+        )
+        with self.assertLogs(clms.LOGGER, level="WARNING") as messages:
+            entries = clms.parse_source(source)[0].entries
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].body, "前半\n後半")
+        self.assertTrue(any("想定外の形式" in message for message in messages.output))
+        self.assertTrue(any("不正な日付" in message for message in messages.output))
 
     def test_tab_only_lines_are_preserved_as_empty_body_lines(self):
         source = (
